@@ -33,3 +33,97 @@ When natural disasters (earthquakes, cyclones, floods) or major infrastructure f
 ---
 
 ## 🏗️ Architecture
+┌────────────────────────────────────────────────────────┐
+│                   Jetpack Compose UI                   │
+│   (SOS Dispatch Sheet | Emergency Feed | Peer Radar)   │
+└───────────────────────────┬────────────────────────────┘
+│
+┌───────────────────────────▼────────────────────────────┐
+│                    ViewModel Layer                     │
+│    (StateFlow, Lamport Clock Tick, UI State Machine)   │
+└─────────────┬────────────────────────────┬─────────────┘
+│                            │
+┌─────────────▼────────────┐ ┌─────────────▼─────────────┐
+│   Offline Sync Engine    │ │   P2P Mesh Network Layer  │
+│  - Merkle / Clock Vector │ │  - Nearby Connections API │
+│  - Gossip Deduplication  │ │  - BLE + Wi-Fi Direct     │
+│  - Conflict Resolution   │ │  - Epidemic Routing (TTL) │
+└─────────────┬────────────┘ └─────────────┬─────────────┘
+│                            │
+┌─────────────▼────────────────────────────▼─────────────┐
+│                 Room Database (SQLite)                 │
+│               Local Storage & Persistence              │
+└────────────────────────────────────────────────────────┘
+
+
+---
+
+## 🔬 How It Works Under the Hood
+
+### 1. Zero-Bandwidth Dual-Radio Tunneling
+1. **Discovery (Bluetooth Low Energy):** Every active node continuously advertises and scans for the unique service identifier `com.silentbeacon.mesh.v1`. BLE provides micro-power consumption while constantly seeking neighboring devices.
+2. **Autonomous Handshake:** When Device A spots Device B, both negotiate a secure cryptographic handshake and auto-accept the connection via `client.acceptConnection()`.
+3. **High-Speed Socket Upgrade (Wi-Fi Direct / SoftAP):** For payload transmission, the radio stack dynamically switches to an ad-hoc Wi-Fi Direct cluster (forming a high-bandwidth local TCP/IP socket between devices) without any internet connection.
+
+### 2. State Synchronization via Vector Clocks
+When two nodes connect:
+1. Node A sends a `Handshake` packet containing its current `maxClockObserved` and a list of known `ticketId` hashes.
+2. Node B compares Node A's vector against its local SQLite database.
+3. Node B transmits only missing tickets inside a `DeltaBundle`.
+4. Node A applies the delta locally, advances its Lamport clock to `max(localClock, remoteClock) + 1`, increments `hopCount`, and forwards the bundle to any other peers connected in its radio cluster.
+
+---
+
+## 🛠️ Tech Stack
+
+| Layer | Technology |
+| :--- | :--- |
+| **Language** | Kotlin 2.0 (Coroutines, Flow, Serialization) |
+| **UI Framework** | Jetpack Compose + Material 3 |
+| **Mesh Networking** | Google Play Services Nearby Connections API (`Strategy.P2P_CLUSTER`) |
+| **Physical Radios** | Bluetooth Low Energy (BLE) + Wi-Fi Direct / Local Hotspot |
+| **Local Database** | Room (SQLite) with reactive Flow query streams |
+| **Concurreny & Sync**| Custom CRDT Layer with Monotonic Lamport Timestamps |
+
+---
+
+## 📂 Project Structure
+
+app/src/main/java/com/silentbeacon/
+├── data/
+│   ├── local/
+│   │   ├── BeaconDatabase.kt           # Room database definition
+│   │   └── TicketDao.kt                # SQLite reactive queries & CRDT write rules
+│   ├── model/
+│   │   └── TicketModels.kt             # Tickets, SyncVectorClock & MeshPayload models
+│   └── sync/
+│       └── MeshSyncEngine.kt           # Vector clock sync, delta calculation & Lamport ordering
+├── network/
+│   └── NearbyConnectionsMeshManager.kt # P2P Cluster discovery, connection lifecycle & radio I/O
+├── service/
+│   └── MeshRelayService.kt             # Foreground background relay service
+├── ui/
+│   ├── EmergencyDashboardScreen.kt     # Radar bar, emergency feed & SOS creation dialog
+│   └── theme/                          # Material 3 colors, typography & shapes
+└── MainActivity.kt                     # Permission orchestration & lifecycle binding
+
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+- Android Studio Ladybug (2024.2.1) or newer
+- JDK 17+
+- **Two physical Android devices** running Android 8.0 (API 26) or higher *(Nearby Connections radio mesh cannot be fully simulated in an emulator)*
+
+### Permissions
+SilentBeacon requires access to low-level radio hardware. In accordance with Android 12+ privacy guidelines, it sets `android:usesPermissionFlags="neverForLocation"` to operate without accessing device GPS:
+- `android.permission.BLUETOOTH_SCAN`
+- `android.permission.BLUETOOTH_ADVERTISE`
+- `android.permission.BLUETOOTH_CONNECT`
+- `android.permission.NEARBY_WIFI_DEVICES`
+- `android.permission.ACCESS_FINE_LOCATION` (Required for radio discovery on Android 11 and lower)
+- `android.permission.FOREGROUND_SERVICE` & `FOREGROUND_SERVICE_CONNECTED_DEVICE`
+
+
