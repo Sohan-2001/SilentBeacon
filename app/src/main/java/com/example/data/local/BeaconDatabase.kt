@@ -20,7 +20,7 @@ abstract class BeaconDatabase : RoomDatabase() {
                     context.applicationContext,
                     BeaconDatabase::class.java,
                     "silent_beacon.db"
-                ).fallbackToDestructiveMigration()
+                ).fallbackToDestructiveMigration(true)
                  .build()
                  .also { INSTANCE = it }
             }

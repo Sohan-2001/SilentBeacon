@@ -33,6 +33,7 @@
     <uses-permission
         android:name="android.permission.POST_NOTIFICATIONS"
         tools:targetApi="tiramisu" />
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:name=".SilentBeaconApp"
@@ -49,6 +50,14 @@
             android:name=".service.MeshRelayService"
             android:foregroundServiceType="connectedDevice"
             android:exported="false" />
+
+        <receiver
+            android:name=".alarm.SilenceAlarmReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.example.action.SILENCE_ALARM" />
+            </intent-filter>
+        </receiver>
 
         <activity
             android:name=".MainActivity"

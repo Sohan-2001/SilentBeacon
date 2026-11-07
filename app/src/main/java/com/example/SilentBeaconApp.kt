@@ -19,6 +19,9 @@ class SilentBeaconApp : Application() {
     lateinit var syncEngine: MeshSyncEngine
         private set
 
+    lateinit var alarmManager: com.example.alarm.EmergencyAlarmManager
+        private set
+
     lateinit var localNodeId: String
         private set
 
@@ -28,6 +31,7 @@ class SilentBeaconApp : Application() {
 
         database = BeaconDatabase.getInstance(this)
         localNodeId = getOrCreateNodeId()
+        alarmManager = com.example.alarm.EmergencyAlarmManager(this)
 
         // Create MeshManager first with late delegation to syncEngine
         meshManager = NearbyConnectionsMeshManager(
@@ -45,7 +49,13 @@ class SilentBeaconApp : Application() {
         syncEngine = MeshSyncEngine(
             dao = database.ticketDao(),
             meshManager = meshManager,
-            localNodeId = localNodeId
+            localNodeId = localNodeId,
+            onCriticalAlertReceived = { ticket ->
+                alarmManager.triggerEmergencyAlarm(ticket)
+            },
+            onAlertResolved = { ticketId ->
+                alarmManager.onTicketResolved(ticketId)
+            }
         )
     }
 

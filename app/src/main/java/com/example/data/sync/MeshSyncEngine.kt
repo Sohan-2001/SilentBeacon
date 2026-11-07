@@ -21,7 +21,9 @@ import java.util.concurrent.atomic.AtomicLong
 class MeshSyncEngine(
     private val dao: TicketDao,
     private val meshManager: NearbyConnectionsMeshManager,
-    val localNodeId: String
+    val localNodeId: String,
+    private val onCriticalAlertReceived: ((EmergencyTicket) -> Unit)? = null,
+    private val onAlertResolved: ((String) -> Unit)? = null
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val localLamportClock = AtomicLong(0)
@@ -100,6 +102,14 @@ class MeshSyncEngine(
                     if (shouldAccept) {
                         dao.insertOrUpdate(ticket)
                         newlyInserted++
+
+                        // Alarm System: Automatically ring alarm for critical emergencies received from mesh
+                        if ((ticket.urgency == UrgencyLevel.CRITICAL || ticket.urgency == UrgencyLevel.HIGH) &&
+                            ticket.authorNodeId != localNodeId &&
+                            ticket.status != TicketStatus.RESOLVED) {
+                            onCriticalAlertReceived?.invoke(ticket)
+                        }
+
                         // Check TTL boundary (Epidemic Hop Count)
                         if (ticket.hopCount < ticket.maxHops) {
                             forwardableTickets.add(ticket.copy(hopCount = ticket.hopCount + 1))
@@ -136,6 +146,11 @@ class MeshSyncEngine(
                         )
                         dao.insertOrUpdate(updated)
                         meshManager.logActivity("STATUS_UPDATED", "Ticket ${payload.ticketId.take(8)} -> ${payload.updatedStatus}")
+
+                        if (payload.updatedStatus == TicketStatus.RESOLVED) {
+                            onAlertResolved?.invoke(payload.ticketId)
+                        }
+
                         // Forward status progression through mesh
                         meshManager.broadcastPayload(payload)
                     }

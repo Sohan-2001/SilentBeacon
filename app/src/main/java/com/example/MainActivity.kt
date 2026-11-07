@@ -168,7 +168,9 @@ class MainActivity : ComponentActivity() {
                         onSetCategoryFilter = { viewModel.setCategoryFilter(it) },
                         onSetUrgencyFilter = { viewModel.setUrgencyFilter(it) },
                         onSetStatusFilter = { viewModel.setStatusFilter(it) },
-                        onSetSearchQuery = { viewModel.setSearchQuery(it) }
+                        onSetSearchQuery = { viewModel.setSearchQuery(it) },
+                        onSilenceAlarm = { viewModel.silenceAlarm() },
+                        onTestAlarm = { viewModel.testEmergencyAlarm() }
                     )
                 }
             }

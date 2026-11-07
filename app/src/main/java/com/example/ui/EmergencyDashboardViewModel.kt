@@ -38,7 +38,9 @@ data class DashboardUiState(
     val syncedTicketsCount: Int = 0,
     val lastKnownLocation: Location? = null,
     val isLocating: Boolean = false,
-    val logs: List<MeshActivityLog> = emptyList()
+    val logs: List<MeshActivityLog> = emptyList(),
+    val isAlarmRinging: Boolean = false,
+    val activeAlarmTicket: EmergencyTicket? = null
 )
 
 class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(application) {
@@ -47,6 +49,7 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
     private val dao = app.database.ticketDao()
     private val meshManager = app.meshManager
     private val syncEngine = app.syncEngine
+    private val alarmManager = app.alarmManager
     private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(application)
 
     private val _categoryFilter = MutableStateFlow<TicketCategory?>(null)
@@ -69,7 +72,9 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
         syncEngine.syncedTicketsCount,
         _lastKnownLocation,
         _isLocating,
-        _activityLogs
+        _activityLogs,
+        alarmManager.isAlarmActive,
+        alarmManager.activeCriticalTicket
     ) { params ->
         @Suppress("UNCHECKED_CAST")
         val allTickets = params[0] as List<EmergencyTicket>
@@ -86,6 +91,8 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
         val isLocating = params[10] as Boolean
         @Suppress("UNCHECKED_CAST")
         val logs = params[11] as List<MeshActivityLog>
+        val isAlarmRinging = params[12] as Boolean
+        val activeAlarmTicket = params[13] as EmergencyTicket?
 
         val filtered = allTickets.filter { ticket ->
             val matchesCat = catFilter == null || ticket.category == catFilter
@@ -115,7 +122,9 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
             syncedTicketsCount = synced,
             lastKnownLocation = loc,
             isLocating = isLocating,
-            logs = logs
+            logs = logs,
+            isAlarmRinging = isAlarmRinging,
+            activeAlarmTicket = activeAlarmTicket
         )
     }.stateIn(
         scope = viewModelScope,
@@ -231,5 +240,25 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
         viewModelScope.launch {
             syncEngine.initiateHandshakeWithPeer(endpointId)
         }
+    }
+
+    fun silenceAlarm() {
+        alarmManager.silenceAlarm()
+    }
+
+    fun testEmergencyAlarm() {
+        val testTicket = EmergencyTicket(
+            ticketId = "test-alarm-${System.currentTimeMillis()}",
+            authorNodeId = "peer-drill",
+            category = TicketCategory.MEDICAL,
+            urgency = UrgencyLevel.CRITICAL,
+            title = "SIREN DRILL: Immediate Evacuation Needed",
+            description = "This is a broadcast siren test to verify that device speaker and vibration alarms trigger properly during critical alerts.",
+            locationDescription = "Local Perimeter Drill",
+            status = TicketStatus.OPEN,
+            lamportClock = syncEngine.incrementClock(),
+            createdAtEpochMs = System.currentTimeMillis()
+        )
+        alarmManager.triggerEmergencyAlarm(testTicket)
     }
 }

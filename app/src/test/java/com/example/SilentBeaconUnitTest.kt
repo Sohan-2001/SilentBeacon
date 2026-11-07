@@ -162,4 +162,42 @@ class SilentBeaconUnitTest {
         assertEquals(7, current.hopCount)
         assertFalse(current.hopCount < current.maxHops)
     }
+
+    @Test
+    fun testCriticalAlarmTriggerAlgorithm() {
+        val localNodeId = "local-device-01"
+
+        fun shouldTriggerAlarm(ticket: EmergencyTicket): Boolean {
+            val isCriticalOrHigh = ticket.urgency == UrgencyLevel.CRITICAL || ticket.urgency == UrgencyLevel.HIGH
+            val isRemote = ticket.authorNodeId != localNodeId
+            val isOpen = ticket.status != TicketStatus.RESOLVED
+            return isCriticalOrHigh && isRemote && isOpen
+        }
+
+        val remoteCritical = EmergencyTicket(
+            ticketId = "t1",
+            authorNodeId = "peer-device-99",
+            category = TicketCategory.MEDICAL,
+            urgency = UrgencyLevel.CRITICAL,
+            title = "Heart attack",
+            description = "CPR in progress",
+            locationDescription = "Town Hall",
+            status = TicketStatus.OPEN,
+            lamportClock = 2L,
+            createdAtEpochMs = 1000L
+        )
+        assertTrue("Remote critical ticket must trigger alarm", shouldTriggerAlarm(remoteCritical))
+
+        val remoteHigh = remoteCritical.copy(urgency = UrgencyLevel.HIGH)
+        assertTrue("Remote high urgency ticket must trigger alarm", shouldTriggerAlarm(remoteHigh))
+
+        val ownCritical = remoteCritical.copy(authorNodeId = localNodeId)
+        assertFalse("Self-authored critical ticket must not alarm self", shouldTriggerAlarm(ownCritical))
+
+        val remoteLow = remoteCritical.copy(urgency = UrgencyLevel.LOW)
+        assertFalse("Low urgency ticket must not sound siren alarm", shouldTriggerAlarm(remoteLow))
+
+        val resolvedCritical = remoteCritical.copy(status = TicketStatus.RESOLVED)
+        assertFalse("Resolved critical ticket must not trigger alarm", shouldTriggerAlarm(resolvedCritical))
+    }
 }

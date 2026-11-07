@@ -57,6 +57,9 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VolunteerActivism
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.WaterDrop
 import androidx.compose.material.icons.filled.WifiTethering
@@ -151,7 +154,9 @@ fun EmergencyDashboardScreen(
     onSetCategoryFilter: (TicketCategory?) -> Unit,
     onSetUrgencyFilter: (UrgencyLevel?) -> Unit,
     onSetStatusFilter: (TicketStatus?) -> Unit,
-    onSetSearchQuery: (String) -> Unit
+    onSetSearchQuery: (String) -> Unit,
+    onSilenceAlarm: () -> Unit,
+    onTestAlarm: () -> Unit
 ) {
     var showDispatchDialog by remember { mutableStateOf(false) }
     var showNetworkInfoDialog by remember { mutableStateOf(false) }
@@ -381,6 +386,17 @@ fun EmergencyDashboardScreen(
         }
 
         // Dialogs
+        if (state.isAlarmRinging && state.activeAlarmTicket != null) {
+            CriticalAlarmSirenOverlay(
+                ticket = state.activeAlarmTicket,
+                onSilence = onSilenceAlarm,
+                onViewDetails = {
+                    onSilenceAlarm()
+                    selectedTicketDetail = state.activeAlarmTicket
+                }
+            )
+        }
+
         if (showDispatchDialog) {
             SimpleDispatchDialog(
                 lastKnownLocation = state.lastKnownLocation,
@@ -398,7 +414,8 @@ fun EmergencyDashboardScreen(
             FriendlyNetworkDialog(
                 state = state,
                 onDismiss = { showNetworkInfoDialog = false },
-                onPingPeer = onPingHandshake
+                onPingPeer = onPingHandshake,
+                onTestAlarm = onTestAlarm
             )
         }
 
@@ -1379,7 +1396,8 @@ fun SimpleDispatchDialog(
 fun FriendlyNetworkDialog(
     state: DashboardUiState,
     onDismiss: () -> Unit,
-    onPingPeer: (String) -> Unit
+    onPingPeer: (String) -> Unit,
+    onTestAlarm: () -> Unit
 ) {
     var showTechDetails by remember { mutableStateOf(false) }
 
@@ -1518,6 +1536,31 @@ fun FriendlyNetworkDialog(
                             }
                         }
                     }
+                }
+
+                // Test Siren Button
+                Button(
+                    onClick = onTestAlarm,
+                    colors = ButtonDefaults.buttonColors(containerColor = EmergencyRedLight),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, EmergencyRed.copy(alpha = 0.5f)),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(44.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.NotificationsActive,
+                        contentDescription = null,
+                        tint = EmergencyRed,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "🔊 Test Emergency Siren Sound",
+                        color = EmergencyRed,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp
+                    )
                 }
 
                 // Expandable Technical Diagnostics Toggle
@@ -1779,4 +1822,162 @@ fun formatRelativeTime(epochMs: Long): String {
         diffSec < 86400 -> "${diffSec / 3600}h ago"
         else -> "${diffSec / 86400}d ago"
     }
+}
+
+@Composable
+fun CriticalAlarmSirenOverlay(
+    ticket: EmergencyTicket,
+    onSilence: () -> Unit,
+    onViewDetails: () -> Unit
+) {
+    val transition = rememberInfiniteTransition(label = "siren_pulse")
+    val borderAlpha by transition.animateFloat(
+        initialValue = 0.4f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(600),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "siren_alpha"
+    )
+
+    AlertDialog(
+        onDismissRequest = { /* Must be explicitly silenced or acknowledged */ },
+        title = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .background(EmergencyRed.copy(alpha = 0.15f), CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.CrisisAlert,
+                        contentDescription = "Siren Alert",
+                        tint = EmergencyRed,
+                        modifier = Modifier.size(38.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
+                Text(
+                    text = "🚨 CRITICAL EMERGENCY ALARM",
+                    fontWeight = FontWeight.Black,
+                    fontSize = 17.sp,
+                    color = EmergencyRed,
+                    textAlign = TextAlign.Center
+                )
+
+                Text(
+                    text = "High priority SOS broadcast received nearby",
+                    fontSize = 12.sp,
+                    color = DayTextSecondary,
+                    textAlign = TextAlign.Center
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                // Emergency Summary Box
+                Surface(
+                    color = EmergencyRedLight,
+                    shape = RoundedCornerShape(12.dp),
+                    border = androidx.compose.foundation.BorderStroke(
+                        width = 2.dp,
+                        color = EmergencyRed.copy(alpha = borderAlpha)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = ticket.title,
+                            fontSize = 17.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = EmergencyRedHover
+                        )
+
+                        if (ticket.description.isNotBlank()) {
+                            Text(
+                                text = ticket.description,
+                                fontSize = 13.sp,
+                                color = DayTextPrimary,
+                                maxLines = 4,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        Spacer(modifier = Modifier.height(2.dp))
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.LocationOn,
+                                contentDescription = null,
+                                tint = EmergencyRed,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = ticket.locationDescription,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.Bold,
+                                color = DayTextPrimary
+                            )
+                        }
+                    }
+                }
+
+                Text(
+                    text = "Your phone's alarm is sounding to ensure this urgent life-safety broadcast is heard.",
+                    fontSize = 11.sp,
+                    color = DayTextSecondary,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 15.sp,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onViewDetails,
+                colors = ButtonDefaults.buttonColors(containerColor = EmergencyRed),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(46.dp)
+            ) {
+                Icon(Icons.Default.LocationOn, contentDescription = null, tint = White, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("VIEW LOCATION & RESPOND", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+        },
+        dismissButton = {
+            OutlinedButton(
+                onClick = onSilence,
+                border = androidx.compose.foundation.BorderStroke(1.5.dp, DayBorder),
+                shape = RoundedCornerShape(10.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(42.dp)
+            ) {
+                Icon(Icons.AutoMirrored.Filled.VolumeOff, contentDescription = null, tint = DayTextSecondary, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("SILENCE ALARM", color = DayTextPrimary, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+            }
+        },
+        containerColor = White,
+        textContentColor = DayTextPrimary,
+        titleContentColor = DayTextPrimary
+    )
 }
