@@ -15,19 +15,28 @@ import com.example.service.MeshRelayService
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
 import com.google.android.gms.tasks.CancellationTokenSource
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import java.util.UUID
+
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.flatMapLatest
+import com.example.network.MeshRadioStatus
 
 data class DashboardUiState(
     val tickets: List<EmergencyTicket> = emptyList(),
     val filteredTickets: List<EmergencyTicket> = emptyList(),
     val connectedPeers: Set<String> = emptySet(),
     val isMeshActive: Boolean = false,
+    val radioStatus: MeshRadioStatus = MeshRadioStatus.STOPPED,
     val selectedCategoryFilter: TicketCategory? = null,
     val selectedUrgencyFilter: UrgencyLevel? = null,
     val selectedStatusFilter: TicketStatus? = null,
@@ -47,8 +56,6 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
 
     private val app = application as SilentBeaconApp
     private val dao = app.database.ticketDao()
-    private val meshManager = app.meshManager
-    private val syncEngine = app.syncEngine
     private val alarmManager = app.alarmManager
     private val fusedLocationClient = LocationServices.getFusedLocationProviderClient(application)
 
@@ -60,16 +67,32 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
     private val _isLocating = MutableStateFlow(false)
     private val _activityLogs = MutableStateFlow<List<MeshActivityLog>>(emptyList())
 
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val peersFlow: Flow<Set<String>> = app.meshManagerFlow.flatMapLatest { it?.connectedPeers ?: flowOf(emptySet()) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val meshActiveFlow: Flow<Boolean> = app.meshManagerFlow.flatMapLatest { it?.isMeshActive ?: flowOf(false) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val radioStatusFlow: Flow<MeshRadioStatus> = app.meshManagerFlow.flatMapLatest { it?.radioStatus ?: flowOf(MeshRadioStatus.STOPPED) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val relaysFlow: Flow<Int> = app.syncEngineFlow.flatMapLatest { it?.relayedPacketsCount ?: flowOf(0) }
+
+    @OptIn(ExperimentalCoroutinesApi::class)
+    private val syncedFlow: Flow<Int> = app.syncEngineFlow.flatMapLatest { it?.syncedTicketsCount ?: flowOf(0) }
+
     val uiState: StateFlow<DashboardUiState> = combine(
         dao.observeAllTickets(),
-        meshManager.connectedPeers,
-        meshManager.isMeshActive,
+        peersFlow,
+        meshActiveFlow,
+        radioStatusFlow,
         _categoryFilter,
         _urgencyFilter,
         _statusFilter,
         _searchQuery,
-        syncEngine.relayedPacketsCount,
-        syncEngine.syncedTicketsCount,
+        relaysFlow,
+        syncedFlow,
         _lastKnownLocation,
         _isLocating,
         _activityLogs,
@@ -81,18 +104,19 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
         @Suppress("UNCHECKED_CAST")
         val peers = params[1] as Set<String>
         val isMeshActive = params[2] as Boolean
-        val catFilter = params[3] as TicketCategory?
-        val urgFilter = params[4] as UrgencyLevel?
-        val statusFilter = params[5] as TicketStatus?
-        val query = params[6] as String
-        val relays = params[7] as Int
-        val synced = params[8] as Int
-        val loc = params[9] as Location?
-        val isLocating = params[10] as Boolean
+        val radioStatus = params[3] as MeshRadioStatus
+        val catFilter = params[4] as TicketCategory?
+        val urgFilter = params[5] as UrgencyLevel?
+        val statusFilter = params[6] as TicketStatus?
+        val query = params[7] as String
+        val relays = params[8] as Int
+        val synced = params[9] as Int
+        val loc = params[10] as Location?
+        val isLocating = params[11] as Boolean
         @Suppress("UNCHECKED_CAST")
-        val logs = params[11] as List<MeshActivityLog>
-        val isAlarmRinging = params[12] as Boolean
-        val activeAlarmTicket = params[13] as EmergencyTicket?
+        val logs = params[12] as List<MeshActivityLog>
+        val isAlarmRinging = params[13] as Boolean
+        val activeAlarmTicket = params[14] as EmergencyTicket?
 
         val filtered = allTickets.filter { ticket ->
             val matchesCat = catFilter == null || ticket.category == catFilter
@@ -112,12 +136,13 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
             filteredTickets = filtered,
             connectedPeers = peers,
             isMeshActive = isMeshActive,
+            radioStatus = radioStatus,
             selectedCategoryFilter = catFilter,
             selectedUrgencyFilter = urgFilter,
             selectedStatusFilter = statusFilter,
             searchQuery = query,
             localNodeId = app.localNodeId,
-            lamportClock = syncEngine.getClock(),
+            lamportClock = app.syncEngine?.getClock() ?: 0L,
             relayedPacketsCount = relays,
             syncedTicketsCount = synced,
             lastKnownLocation = loc,
@@ -133,10 +158,12 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
     )
 
     init {
-        // Collect radio activity logs
+        // Collect radio activity logs dynamically whenever mesh manager is active
         viewModelScope.launch {
-            meshManager.activityLogs.collect { newLog ->
-                _activityLogs.value = (listOf(newLog) + _activityLogs.value).take(100)
+            app.meshManagerFlow.collectLatest { manager ->
+                manager?.activityLogs?.collect { newLog ->
+                    _activityLogs.value = (listOf(newLog) + _activityLogs.value).take(100)
+                }
             }
         }
         // Fetch initial GPS
@@ -144,12 +171,23 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
     }
 
     fun startMeshService() {
+        if (app.meshManager == null) {
+            app.initMeshLayerSafely()
+        }
         MeshRelayService.startService(app)
-        meshManager.startMesh()
+        app.meshManager?.startMesh()
+    }
+
+    fun simulateNearbyPeer(): String? {
+        return app.meshManager?.simulatePeerConnection()
+    }
+
+    fun disconnectSimulatedPeer(peerId: String) {
+        app.meshManager?.simulatePeerDisconnection(peerId)
     }
 
     fun stopMeshService() {
-        meshManager.stopMesh()
+        app.meshManager?.stopMesh()
         MeshRelayService.stopService(app)
     }
 
@@ -212,33 +250,79 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
         viewModelScope.launch {
             val lat = latitude ?: _lastKnownLocation.value?.latitude
             val lng = longitude ?: _lastKnownLocation.value?.longitude
-            syncEngine.createAndBroadcastTicket(
-                category = category,
-                urgency = urgency,
-                title = title,
-                description = description,
-                latitude = lat,
-                longitude = lng,
-                locationDescription = locationDescription
-            )
+            val engine = app.syncEngine
+            if (engine != null) {
+                engine.createAndBroadcastTicket(
+                    category = category,
+                    urgency = urgency,
+                    title = title,
+                    description = description,
+                    latitude = lat,
+                    longitude = lng,
+                    locationDescription = locationDescription
+                )
+            } else {
+                // If radios are disabled or unsupported, safely save to local Room database
+                val fallbackTicket = EmergencyTicket(
+                    ticketId = UUID.randomUUID().toString(),
+                    authorNodeId = app.localNodeId,
+                    category = category,
+                    urgency = urgency,
+                    title = title,
+                    description = description,
+                    latitude = lat,
+                    longitude = lng,
+                    locationDescription = locationDescription,
+                    status = TicketStatus.OPEN,
+                    lamportClock = 1L,
+                    createdAtEpochMs = System.currentTimeMillis()
+                )
+                dao.insertOrUpdate(fallbackTicket)
+            }
         }
     }
 
     fun markTicketResolved(ticketId: String) {
         viewModelScope.launch {
-            syncEngine.updateStatusAndBroadcast(ticketId, TicketStatus.RESOLVED)
+            val engine = app.syncEngine
+            if (engine != null) {
+                engine.updateStatusAndBroadcast(ticketId, TicketStatus.RESOLVED)
+            } else {
+                dao.getTicketById(ticketId)?.let {
+                    dao.insertOrUpdate(it.copy(status = TicketStatus.RESOLVED))
+                }
+            }
         }
     }
 
     fun markTicketAcknowledged(ticketId: String) {
         viewModelScope.launch {
-            syncEngine.updateStatusAndBroadcast(ticketId, TicketStatus.ACKNOWLEDGED)
+            val engine = app.syncEngine
+            if (engine != null) {
+                engine.updateStatusAndBroadcast(ticketId, TicketStatus.ACKNOWLEDGED)
+            } else {
+                dao.getTicketById(ticketId)?.let {
+                    dao.insertOrUpdate(it.copy(status = TicketStatus.ACKNOWLEDGED))
+                }
+            }
+        }
+    }
+
+    fun deleteTicket(ticketId: String) {
+        viewModelScope.launch {
+            dao.deleteTicket(ticketId)
+        }
+    }
+
+    fun clearAllResolvedTickets() {
+        viewModelScope.launch {
+            dao.deleteAllResolvedTickets()
         }
     }
 
     fun pingPeerHandshake(endpointId: String) {
         viewModelScope.launch {
-            syncEngine.initiateHandshakeWithPeer(endpointId)
+            app.syncEngine?.initiateHandshakeWithPeer(endpointId)
         }
     }
 
@@ -256,7 +340,7 @@ class EmergencyDashboardViewModel(application: Application) : AndroidViewModel(a
             description = "This is a broadcast siren test to verify that device speaker and vibration alarms trigger properly during critical alerts.",
             locationDescription = "Local Perimeter Drill",
             status = TicketStatus.OPEN,
-            lamportClock = syncEngine.incrementClock(),
+            lamportClock = app.syncEngine?.incrementClock() ?: 1L,
             createdAtEpochMs = System.currentTimeMillis()
         )
         alarmManager.triggerEmergencyAlarm(testTicket)

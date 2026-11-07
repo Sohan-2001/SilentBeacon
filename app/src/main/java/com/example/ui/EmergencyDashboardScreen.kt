@@ -134,12 +134,45 @@ import com.example.ui.theme.DayTextTertiary
 import com.example.ui.theme.EmergencyRed
 import com.example.ui.theme.EmergencyRedHover
 import com.example.ui.theme.EmergencyRedLight
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.MenuBook
+import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.NavigationDrawerItem
+import androidx.compose.material3.NavigationDrawerItemDefaults
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
+import com.example.ui.components.VicinityRadarTab
+import com.example.ui.components.ResolvedSolutionsTab
+import com.example.ui.components.SurvivalGuideTab
 import com.example.ui.theme.SafetyAmber
 import com.example.ui.theme.SafetyAmberLight
 import com.example.ui.theme.White
+import com.example.ui.components.MeshSignalStrengthCard
+import com.example.ui.components.SignalBarsWidget
+import com.example.ui.components.TopBarSignalStrengthPill
+import com.example.ui.components.calculateMeshSignalInfo
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+enum class DashboardTab(val label: String, val icon: ImageVector) {
+    LIVE_SOS("Live SOS", Icons.Default.Podcasts),
+    VICINITY_RADAR("Mesh Radar", Icons.Default.Sensors),
+    RESOLVED_SOLUTIONS("Resolved", Icons.Default.CheckCircle),
+    SURVIVAL_GUIDE("Survival Guide", Icons.Default.MenuBook)
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -156,283 +189,554 @@ fun EmergencyDashboardScreen(
     onSetStatusFilter: (TicketStatus?) -> Unit,
     onSetSearchQuery: (String) -> Unit,
     onSilenceAlarm: () -> Unit,
-    onTestAlarm: () -> Unit
+    onTestAlarm: () -> Unit,
+    onDeleteTicket: (String) -> Unit = {},
+    onClearAllResolved: () -> Unit = {},
+    onSimulatePeer: () -> Unit = {},
+    onDisconnectPeer: (String) -> Unit = {}
 ) {
+    var selectedTab by remember { mutableStateOf(DashboardTab.LIVE_SOS) }
+    val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
+    val coroutineScope = rememberCoroutineScope()
+
     var showDispatchDialog by remember { mutableStateOf(false) }
     var showNetworkInfoDialog by remember { mutableStateOf(false) }
     var selectedTicketDetail by remember { mutableStateOf<EmergencyTicket?>(null) }
     var isSearchExpanded by remember { mutableStateOf(false) }
 
-    Scaffold(
-        modifier = Modifier
-            .fillMaxSize()
-            .testTag("dashboard_scaffold"),
-        contentWindowInsets = WindowInsets.safeDrawing,
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                text = "SilentBeacon",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 20.sp,
-                                color = DayTextPrimary
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            // Simple friendly pulse dot
-                            DayPulseIndicator(isActive = state.isMeshActive && state.connectedPeers.isNotEmpty())
-                        }
-                        Text(
-                            text = "Offline Emergency Mesh",
-                            fontSize = 12.sp,
-                            color = DayTextSecondary
-                        )
-                    }
-                },
-                actions = {
-                    // Friendly device connection button
-                    Surface(
-                        modifier = Modifier
-                            .testTag("peer_radar_button")
-                            .clickable { showNetworkInfoDialog = true }
-                            .padding(end = 8.dp),
-                        shape = RoundedCornerShape(20.dp),
-                        color = if (state.connectedPeers.isNotEmpty()) CalmGreenLight else DaySurfaceVariant,
-                        border = androidx.compose.foundation.BorderStroke(
-                            1.dp,
-                            if (state.connectedPeers.isNotEmpty()) CalmGreen.copy(alpha = 0.4f) else DayBorder
-                        )
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(
-                                imageVector = if (state.connectedPeers.isNotEmpty()) Icons.Default.WifiTethering else Icons.Default.Podcasts,
-                                contentDescription = "Network Status",
-                                tint = if (state.connectedPeers.isNotEmpty()) CalmGreen else DayTextSecondary,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = if (state.connectedPeers.isNotEmpty()) {
-                                    "${state.connectedPeers.size} Nearby"
-                                } else {
-                                    "Ready"
-                                },
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = if (state.connectedPeers.isNotEmpty()) CalmGreen else DayTextSecondary
-                            )
-                        }
-                    }
+    val activeTickets = remember(state.filteredTickets) {
+        state.filteredTickets.filter { it.status != TicketStatus.RESOLVED }
+    }
+    val resolvedTicketsCount = remember(state.tickets) {
+        state.tickets.count { it.status == TicketStatus.RESOLVED }
+    }
+    val activeTicketsCount = remember(state.tickets) {
+        state.tickets.count { it.status != TicketStatus.RESOLVED }
+    }
 
-                    // Mesh radio switch
-                    Switch(
-                        checked = state.isMeshActive,
-                        onCheckedChange = { onToggleMesh(it) },
-                        modifier = Modifier
-                            .padding(end = 12.dp)
-                            .testTag("mesh_power_switch"),
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = White,
-                            checkedTrackColor = CalmGreen,
-                            uncheckedThumbColor = DayTextTertiary,
-                            uncheckedTrackColor = DayBorder
-                        )
-                    )
-                },
-                colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = DaySurface,
-                    titleContentColor = DayTextPrimary
-                )
-            )
-        },
-        floatingActionButton = {
-            FloatingActionButton(
-                onClick = { showDispatchDialog = true },
-                containerColor = EmergencyRed,
-                contentColor = White,
-                shape = RoundedCornerShape(20.dp),
-                elevation = androidx.compose.material3.FloatingActionButtonDefaults.elevation(6.dp),
-                modifier = Modifier
-                    .testTag("broadcast_sos_fab")
-                    .padding(bottom = 8.dp)
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet(
+                drawerContainerColor = DaySurface,
+                modifier = Modifier.widthIn(max = 320.dp)
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.CrisisAlert,
-                        contentDescription = "Ask for Help",
-                        modifier = Modifier.size(24.dp)
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text(
-                        text = "ASK FOR HELP",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 15.sp,
-                        letterSpacing = 0.5.sp
-                    )
-                }
-            }
-        }
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-                .background(DayBackground)
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .widthIn(max = 680.dp)
-                    .align(Alignment.CenterHorizontally)
-            ) {
-                LazyColumn(
+                Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .testTag("tickets_feed_list"),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 110.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                        .padding(18.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Hero Emergency Card (Easy for anyone to tap immediately)
-                    item {
-                        EmergencyHeroCard(
-                            onAskForHelp = { showDispatchDialog = true },
-                            onCheckGps = onFetchLocation,
-                            lastKnownLocation = state.lastKnownLocation,
-                            isLocating = state.isLocating
-                        )
-                    }
-
-                    // Simple Clean Filters
-                    item {
-                        SimplifiedFiltersSection(
-                            state = state,
-                            isSearchExpanded = isSearchExpanded,
-                            onToggleSearch = { isSearchExpanded = !isSearchExpanded },
-                            onSetCategory = onSetCategoryFilter,
-                            onSetUrgency = onSetUrgencyFilter,
-                            onSetStatus = onSetStatusFilter,
-                            onSetSearchQuery = onSetSearchQuery
-                        )
-                    }
-
-                    // Feed Section Title
-                    item {
-                        Row(
+                    // Drawer Header
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(top = 4.dp),
+                                .size(44.dp)
+                                .background(ActionBlueLight, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Podcasts,
+                                contentDescription = null,
+                                tint = ActionBlue,
+                                modifier = Modifier.size(24.dp)
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(12.dp))
+                        Column {
+                            Text("SilentBeacon", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = DayTextPrimary)
+                            Text("Zero-Bandwidth Mesh", fontSize = 12.sp, color = DayTextSecondary)
+                        }
+                    }
+
+                    // Node ID & Signal Summary Chip
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = DaySurfaceVariant,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, DayBorder),
+                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
+                            Column {
+                                Text("DEVICE NODE ID", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = DayTextSecondary)
+                                Text(state.localNodeId.take(8), fontSize = 12.sp, fontWeight = FontWeight.Bold, color = DayTextPrimary, fontFamily = FontFamily.Monospace)
+                            }
+                            TopBarSignalStrengthPill(
+                                connectedCount = state.connectedPeers.size,
+                                isMeshActive = state.isMeshActive,
+                                onClick = {
+                                    selectedTab = DashboardTab.VICINITY_RADAR
+                                    coroutineScope.launch { drawerState.close() }
+                                }
+                            )
+                        }
+                    }
+
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp), color = DayBorder)
+
+                    Text("NAVIGATION", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = DayTextSecondary, letterSpacing = 0.5.sp)
+
+                    DashboardTab.entries.forEach { tab ->
+                        NavigationDrawerItem(
+                            icon = { Icon(tab.icon, contentDescription = null) },
+                            label = { Text(tab.label, fontWeight = if (selectedTab == tab) FontWeight.Bold else FontWeight.Medium) },
+                            selected = selectedTab == tab,
+                            onClick = {
+                                selectedTab = tab
+                                coroutineScope.launch { drawerState.close() }
+                            },
+                            badge = {
+                                when (tab) {
+                                    DashboardTab.LIVE_SOS -> if (activeTicketsCount > 0) {
+                                        Surface(shape = CircleShape, color = EmergencyRed) {
+                                            Text("$activeTicketsCount", color = White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
+                                        }
+                                    }
+                                    DashboardTab.VICINITY_RADAR -> if (state.connectedPeers.isNotEmpty()) {
+                                        Surface(shape = CircleShape, color = CalmGreen) {
+                                            Text("${state.connectedPeers.size}", color = White, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
+                                        }
+                                    }
+                                    DashboardTab.RESOLVED_SOLUTIONS -> if (resolvedTicketsCount > 0) {
+                                        Surface(shape = CircleShape, color = DaySurfaceVariant) {
+                                            Text("$resolvedTicketsCount", color = DayTextSecondary, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp))
+                                        }
+                                    }
+                                    else -> {}
+                                }
+                            },
+                            colors = NavigationDrawerItemDefaults.colors(
+                                selectedContainerColor = ActionBlueLight,
+                                selectedIconColor = ActionBlue,
+                                selectedTextColor = ActionBlue,
+                                unselectedIconColor = DayTextSecondary,
+                                unselectedTextColor = DayTextPrimary
+                            ),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                    }
+
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp), color = DayBorder)
+
+                    Text("QUICK TOOLS", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = DayTextSecondary, letterSpacing = 0.5.sp)
+
+                    NavigationDrawerItem(
+                        icon = { Icon(Icons.Default.NotificationsActive, contentDescription = null, tint = EmergencyRed) },
+                        label = { Text("Sound Siren Drill", color = EmergencyRed, fontWeight = FontWeight.Bold) },
+                        selected = false,
+                        onClick = {
+                            onTestAlarm()
+                            coroutineScope.launch { drawerState.close() }
+                        },
+                        colors = NavigationDrawerItemDefaults.colors(unselectedContainerColor = EmergencyRedLight),
+                        shape = RoundedCornerShape(10.dp)
+                    )
+
+                    Spacer(modifier = Modifier.weight(1f, fill = false))
+
+                    // Bottom Drawer Footer
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = DaySurfaceVariant,
+                        modifier = Modifier.fillMaxWidth().padding(top = 16.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column {
+                                Text("Mesh Radios", fontWeight = FontWeight.Bold, fontSize = 12.sp, color = DayTextPrimary)
+                                Text(if (state.isMeshActive) "BLE & Wi-Fi Active" else "Offline", fontSize = 11.sp, color = if (state.isMeshActive) CalmGreen else DayTextSecondary)
+                            }
+                            Switch(
+                                checked = state.isMeshActive,
+                                onCheckedChange = { onToggleMesh(it) },
+                                colors = SwitchDefaults.colors(checkedThumbColor = White, checkedTrackColor = CalmGreen)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    ) {
+        Scaffold(
+            modifier = Modifier
+                .fillMaxSize()
+                .testTag("dashboard_scaffold"),
+            contentWindowInsets = WindowInsets.safeDrawing,
+            topBar = {
+                TopAppBar(
+                    navigationIcon = {
+                        IconButton(
+                            onClick = { coroutineScope.launch { drawerState.open() } },
+                            modifier = Modifier.testTag("hamburger_menu_button")
+                        ) {
+                            Icon(Icons.Default.Menu, contentDescription = "Open Navigation Menu", tint = DayTextPrimary)
+                        }
+                    },
+                    title = {
+                        Column {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = when (selectedTab) {
+                                        DashboardTab.LIVE_SOS -> "SilentBeacon"
+                                        DashboardTab.VICINITY_RADAR -> "Vicinity Radar"
+                                        DashboardTab.RESOLVED_SOLUTIONS -> "Resolved Archive"
+                                        DashboardTab.SURVIVAL_GUIDE -> "Survival Guide"
+                                    },
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 18.sp,
+                                    color = DayTextPrimary
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                DayPulseIndicator(isActive = state.isMeshActive && state.connectedPeers.isNotEmpty())
+                            }
                             Text(
-                                text = when {
-                                    state.selectedStatusFilter == TicketStatus.RESOLVED -> "RESOLVED SITUATIONS (${state.filteredTickets.size})"
-                                    state.selectedStatusFilter == TicketStatus.OPEN -> "ACTIVE CALLS FOR HELP (${state.filteredTickets.size})"
-                                    else -> "LOCAL ALERTS & NEEDS (${state.filteredTickets.size})"
+                                text = when (selectedTab) {
+                                    DashboardTab.LIVE_SOS -> "Offline Emergency Mesh"
+                                    DashboardTab.VICINITY_RADAR -> "${state.connectedPeers.size} Connected Nodes in Range"
+                                    DashboardTab.RESOLVED_SOLUTIONS -> "$resolvedTicketsCount Solved Situations"
+                                    DashboardTab.SURVIVAL_GUIDE -> "Disaster Protocols & Signals"
                                 },
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
+                                color = DayTextSecondary
+                            )
+                        }
+                    },
+                    actions = {
+                        // Visual signal strength indicator pill
+                        TopBarSignalStrengthPill(
+                            connectedCount = state.connectedPeers.size,
+                            isMeshActive = state.isMeshActive,
+                            onClick = { selectedTab = DashboardTab.VICINITY_RADAR },
+                            modifier = Modifier.padding(end = 4.dp)
+                        )
+
+                        // Mesh radio switch
+                        Switch(
+                            checked = state.isMeshActive,
+                            onCheckedChange = { onToggleMesh(it) },
+                            modifier = Modifier
+                                .padding(end = 8.dp)
+                                .testTag("mesh_power_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = White,
+                                checkedTrackColor = CalmGreen,
+                                uncheckedThumbColor = DayTextTertiary,
+                                uncheckedTrackColor = DayBorder
+                            )
+                        )
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = DaySurface,
+                        titleContentColor = DayTextPrimary
+                    )
+                )
+            },
+            bottomBar = {
+                NavigationBar(
+                    containerColor = DaySurface,
+                    tonalElevation = 3.dp,
+                    modifier = Modifier.testTag("dashboard_bottom_bar")
+                ) {
+                    DashboardTab.entries.forEach { tab ->
+                        NavigationBarItem(
+                            selected = selectedTab == tab,
+                            onClick = { selectedTab = tab },
+                            icon = {
+                                when (tab) {
+                                    DashboardTab.LIVE_SOS -> {
+                                        if (activeTicketsCount > 0) {
+                                            BadgedBox(badge = { Badge { Text("$activeTicketsCount") } }) {
+                                                Icon(tab.icon, contentDescription = tab.label)
+                                            }
+                                        } else {
+                                            Icon(tab.icon, contentDescription = tab.label)
+                                        }
+                                    }
+                                    DashboardTab.VICINITY_RADAR -> {
+                                        if (state.connectedPeers.isNotEmpty()) {
+                                            BadgedBox(badge = { Badge { Text("${state.connectedPeers.size}") } }) {
+                                                Icon(tab.icon, contentDescription = tab.label)
+                                            }
+                                        } else {
+                                            Icon(tab.icon, contentDescription = tab.label)
+                                        }
+                                    }
+                                    DashboardTab.RESOLVED_SOLUTIONS -> {
+                                        if (resolvedTicketsCount > 0) {
+                                            BadgedBox(badge = { Badge { Text("$resolvedTicketsCount") } }) {
+                                                Icon(tab.icon, contentDescription = tab.label)
+                                            }
+                                        } else {
+                                            Icon(tab.icon, contentDescription = tab.label)
+                                        }
+                                    }
+                                    else -> Icon(tab.icon, contentDescription = tab.label)
+                                }
+                            },
+                            label = { Text(tab.label, fontSize = 11.sp, fontWeight = if (selectedTab == tab) FontWeight.Bold else FontWeight.Medium) },
+                            colors = NavigationBarItemDefaults.colors(
+                                selectedIconColor = ActionBlue,
+                                selectedTextColor = ActionBlue,
+                                indicatorColor = ActionBlueLight,
+                                unselectedIconColor = DayTextSecondary,
+                                unselectedTextColor = DayTextSecondary
+                            )
+                        )
+                    }
+                }
+            },
+            floatingActionButton = {
+                if (selectedTab == DashboardTab.LIVE_SOS) {
+                    FloatingActionButton(
+                        onClick = { showDispatchDialog = true },
+                        containerColor = EmergencyRed,
+                        contentColor = White,
+                        shape = RoundedCornerShape(20.dp),
+                        elevation = androidx.compose.material3.FloatingActionButtonDefaults.elevation(6.dp),
+                        modifier = Modifier
+                            .testTag("broadcast_sos_fab")
+                            .padding(bottom = 8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CrisisAlert,
+                                contentDescription = "Ask for Help",
+                                modifier = Modifier.size(24.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "ASK FOR HELP",
                                 fontWeight = FontWeight.Bold,
-                                color = DayTextSecondary,
+                                fontSize = 15.sp,
                                 letterSpacing = 0.5.sp
                             )
+                        }
+                    }
+                }
+            }
+        ) { innerPadding ->
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+                    .background(DayBackground)
+            ) {
+                when (selectedTab) {
+                    DashboardTab.LIVE_SOS -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .widthIn(max = 680.dp)
+                                .align(Alignment.TopCenter)
+                        ) {
+                            LazyColumn(
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .testTag("tickets_feed_list"),
+                                contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 110.dp),
+                                verticalArrangement = Arrangement.spacedBy(14.dp)
+                            ) {
+                                // 1. Visual Signal Strength & Immediate Vicinity Node Density Card
+                                item {
+                                    MeshSignalStrengthCard(
+                                        state = state,
+                                        onOpenNetworkDetails = { selectedTab = DashboardTab.VICINITY_RADAR }
+                                    )
+                                }
 
-                            if (state.connectedPeers.isNotEmpty()) {
-                                Text(
-                                    text = "Syncing with ${state.connectedPeers.size} phone(s)",
-                                    fontSize = 12.sp,
-                                    color = CalmGreen,
-                                    fontWeight = FontWeight.Medium
-                                )
+                                // 2. Hero Emergency Card (Easy for anyone to tap immediately)
+                                item {
+                                    EmergencyHeroCard(
+                                        onAskForHelp = { showDispatchDialog = true },
+                                        onCheckGps = onFetchLocation,
+                                        lastKnownLocation = state.lastKnownLocation,
+                                        isLocating = state.isLocating
+                                    )
+                                }
+
+                                // 3. Simple Clean Filters
+                                item {
+                                    SimplifiedFiltersSection(
+                                        state = state,
+                                        isSearchExpanded = isSearchExpanded,
+                                        onToggleSearch = { isSearchExpanded = !isSearchExpanded },
+                                        onSetCategory = onSetCategoryFilter,
+                                        onSetUrgency = onSetUrgencyFilter,
+                                        onSetStatus = onSetStatusFilter,
+                                        onSetSearchQuery = onSetSearchQuery
+                                    )
+                                }
+
+                                // 4. Feed Section Title: Showing ONLY Active Help Requests
+                                item {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(top = 4.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "ACTIVE CALLS FOR HELP (${activeTickets.size})",
+                                            fontSize = 12.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = DayTextSecondary,
+                                            letterSpacing = 0.5.sp
+                                        )
+
+                                        if (state.connectedPeers.isNotEmpty()) {
+                                            Text(
+                                                text = "Syncing with ${state.connectedPeers.size} node(s)",
+                                                fontSize = 12.sp,
+                                                color = CalmGreen,
+                                                fontWeight = FontWeight.Medium
+                                            )
+                                        }
+                                    }
+                                }
+
+                                // 5. Incident List Items or Empty View
+                                if (activeTickets.isEmpty()) {
+                                    item {
+                                        FriendlyEmptyState(
+                                            isMeshActive = state.isMeshActive,
+                                            peerCount = state.connectedPeers.size,
+                                            hasFilter = state.selectedCategoryFilter != null || state.selectedUrgencyFilter != null || state.searchQuery.isNotBlank(),
+                                            onAskForHelp = { showDispatchDialog = true },
+                                            onClearFilters = {
+                                                onSetCategoryFilter(null)
+                                                onSetUrgencyFilter(null)
+                                                onSetStatusFilter(null)
+                                                onSetSearchQuery("")
+                                            }
+                                        )
+                                    }
+                                } else {
+                                    items(activeTickets, key = { it.ticketId }) { ticket ->
+                                        FriendlyEmergencyCard(
+                                            ticket = ticket,
+                                            isOwnTicket = ticket.authorNodeId == state.localNodeId,
+                                            onCardClick = { selectedTicketDetail = ticket },
+                                            onAcknowledge = { onAcknowledgeTicket(ticket.ticketId) },
+                                            onResolve = { onResolveTicket(ticket.ticketId) }
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
 
-                    // Incident List Items or Empty View
-                    if (state.filteredTickets.isEmpty()) {
-                        item {
-                            FriendlyEmptyState(
-                                isMeshActive = state.isMeshActive,
-                                peerCount = state.connectedPeers.size,
-                                hasFilter = state.selectedCategoryFilter != null || state.selectedUrgencyFilter != null || state.selectedStatusFilter != null || state.searchQuery.isNotBlank(),
-                                onAskForHelp = { showDispatchDialog = true },
-                                onClearFilters = {
-                                    onSetCategoryFilter(null)
-                                    onSetUrgencyFilter(null)
-                                    onSetStatusFilter(null)
-                                    onSetSearchQuery("")
-                                }
+                    DashboardTab.VICINITY_RADAR -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .widthIn(max = 680.dp)
+                                .align(Alignment.TopCenter)
+                        ) {
+                            VicinityRadarTab(
+                                state = state,
+                                onPingPeer = onPingHandshake,
+                                onSimulatePeer = onSimulatePeer,
+                                onDisconnectPeer = onDisconnectPeer
                             )
                         }
-                    } else {
-                        items(state.filteredTickets, key = { it.ticketId }) { ticket ->
-                            FriendlyEmergencyCard(
-                                ticket = ticket,
-                                isOwnTicket = ticket.authorNodeId == state.localNodeId,
-                                onCardClick = { selectedTicketDetail = ticket },
-                                onAcknowledge = { onAcknowledgeTicket(ticket.ticketId) },
-                                onResolve = { onResolveTicket(ticket.ticketId) }
+                    }
+
+                    DashboardTab.RESOLVED_SOLUTIONS -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .widthIn(max = 680.dp)
+                                .align(Alignment.TopCenter)
+                        ) {
+                            ResolvedSolutionsTab(
+                                state = state,
+                                onDeleteTicket = onDeleteTicket,
+                                onClearAllResolved = onClearAllResolved,
+                                onTicketClick = { selectedTicketDetail = it }
+                            )
+                        }
+                    }
+
+                    DashboardTab.SURVIVAL_GUIDE -> {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .widthIn(max = 680.dp)
+                                .align(Alignment.TopCenter)
+                        ) {
+                            SurvivalGuideTab(
+                                onTestAlarm = onTestAlarm
                             )
                         }
                     }
                 }
             }
-        }
 
-        // Dialogs
-        if (state.isAlarmRinging && state.activeAlarmTicket != null) {
-            CriticalAlarmSirenOverlay(
-                ticket = state.activeAlarmTicket,
-                onSilence = onSilenceAlarm,
-                onViewDetails = {
-                    onSilenceAlarm()
-                    selectedTicketDetail = state.activeAlarmTicket
-                }
-            )
-        }
+            // Dialogs
+            if (state.isAlarmRinging && state.activeAlarmTicket != null) {
+                CriticalAlarmSirenOverlay(
+                    ticket = state.activeAlarmTicket,
+                    onSilence = onSilenceAlarm,
+                    onViewDetails = {
+                        onSilenceAlarm()
+                        selectedTicketDetail = state.activeAlarmTicket
+                    }
+                )
+            }
 
-        if (showDispatchDialog) {
-            SimpleDispatchDialog(
-                lastKnownLocation = state.lastKnownLocation,
-                isLocating = state.isLocating,
-                onRefreshGps = onFetchLocation,
-                onDismiss = { showDispatchDialog = false },
-                onSubmit = { cat, urg, title, desc, locDesc, lat, lng ->
-                    onDispatchTicket(cat, urg, title, desc, locDesc, lat, lng)
-                    showDispatchDialog = false
-                }
-            )
-        }
+            if (showDispatchDialog) {
+                SimpleDispatchDialog(
+                    lastKnownLocation = state.lastKnownLocation,
+                    isLocating = state.isLocating,
+                    onRefreshGps = onFetchLocation,
+                    onDismiss = { showDispatchDialog = false },
+                    onSubmit = { cat, urg, title, desc, locDesc, lat, lng ->
+                        onDispatchTicket(cat, urg, title, desc, locDesc, lat, lng)
+                        showDispatchDialog = false
+                    }
+                )
+            }
 
-        if (showNetworkInfoDialog) {
-            FriendlyNetworkDialog(
-                state = state,
-                onDismiss = { showNetworkInfoDialog = false },
-                onPingPeer = onPingHandshake,
-                onTestAlarm = onTestAlarm
-            )
-        }
+            if (showNetworkInfoDialog) {
+                FriendlyNetworkDialog(
+                    state = state,
+                    onDismiss = { showNetworkInfoDialog = false },
+                    onPingPeer = onPingHandshake,
+                    onTestAlarm = onTestAlarm
+                )
+            }
 
-        selectedTicketDetail?.let { ticket ->
-            FriendlyTicketDetailDialog(
-                ticket = ticket,
-                localNodeId = state.localNodeId,
-                onDismiss = { selectedTicketDetail = null },
-                onAcknowledge = {
-                    onAcknowledgeTicket(ticket.ticketId)
-                    selectedTicketDetail = null
-                },
-                onResolve = {
-                    onResolveTicket(ticket.ticketId)
-                    selectedTicketDetail = null
-                }
-            )
+            selectedTicketDetail?.let { ticket ->
+                FriendlyTicketDetailDialog(
+                    ticket = ticket,
+                    localNodeId = state.localNodeId,
+                    onDismiss = { selectedTicketDetail = null },
+                    onAcknowledge = {
+                        onAcknowledgeTicket(ticket.ticketId)
+                        selectedTicketDetail = null
+                    },
+                    onResolve = {
+                        onResolveTicket(ticket.ticketId)
+                        selectedTicketDetail = null
+                    },
+                    onDelete = {
+                        onDeleteTicket(ticket.ticketId)
+                        selectedTicketDetail = null
+                    }
+                )
+            }
         }
     }
 }
@@ -770,7 +1074,8 @@ fun FriendlyEmergencyCard(
     isOwnTicket: Boolean,
     onCardClick: () -> Unit,
     onAcknowledge: () -> Unit,
-    onResolve: () -> Unit
+    onResolve: () -> Unit,
+    onDelete: (() -> Unit)? = null
 ) {
     val isResolved = ticket.status == TicketStatus.RESOLVED
     val isAcknowledged = ticket.status == TicketStatus.ACKNOWLEDGED
@@ -997,6 +1302,31 @@ fun FriendlyEmergencyCard(
                         Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(16.dp), tint = White)
                         Spacer(modifier = Modifier.width(6.dp))
                         Text("Mark Resolved", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = White)
+                    }
+                }
+            } else if (onDelete != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Button(
+                        onClick = onDelete,
+                        modifier = Modifier
+                            .height(36.dp)
+                            .testTag("delete_resolved_button_${ticket.ticketId}"),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = EmergencyRedLight)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.DeleteOutline,
+                            contentDescription = "Delete Resolved Solution",
+                            modifier = Modifier.size(16.dp),
+                            tint = EmergencyRed
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Delete Solution", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = EmergencyRed)
                     }
                 }
             }
@@ -1620,7 +1950,8 @@ fun FriendlyTicketDetailDialog(
     localNodeId: String,
     onDismiss: () -> Unit,
     onAcknowledge: () -> Unit,
-    onResolve: () -> Unit
+    onResolve: () -> Unit,
+    onDelete: (() -> Unit)? = null
 ) {
     val isResolved = ticket.status == TicketStatus.RESOLVED
     val isAcknowledged = ticket.status == TicketStatus.ACKNOWLEDGED
@@ -1748,7 +2079,16 @@ fun FriendlyTicketDetailDialog(
         },
         confirmButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (!isResolved) {
+                if (isResolved && onDelete != null) {
+                    Button(
+                        onClick = onDelete,
+                        colors = ButtonDefaults.buttonColors(containerColor = EmergencyRedLight)
+                    ) {
+                        Icon(Icons.Default.DeleteOutline, contentDescription = null, tint = EmergencyRed, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Delete Solution", color = EmergencyRed, fontWeight = FontWeight.Bold)
+                    }
+                } else if (!isResolved) {
                     if (!isAcknowledged) {
                         OutlinedButton(onClick = onAcknowledge) {
                             Text("I Can Help", color = ActionBlue)

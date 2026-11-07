@@ -2,5 +2,7 @@
   "name": "SilentBeacon",
   "description": "Local-first zero-bandwidth emergency coordination mesh network for disaster and blackout scenarios.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

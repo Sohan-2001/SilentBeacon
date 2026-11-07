@@ -36,4 +36,7 @@ interface TicketDao {
 
     @Query("DELETE FROM tickets WHERE ticketId = :ticketId")
     suspend fun deleteTicket(ticketId: String)
+
+    @Query("DELETE FROM tickets WHERE status = 'RESOLVED'")
+    suspend fun deleteAllResolvedTickets(): Int
 }

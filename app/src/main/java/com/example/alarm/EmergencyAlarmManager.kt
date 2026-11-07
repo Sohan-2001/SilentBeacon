@@ -71,23 +71,18 @@ class EmergencyAlarmManager(private val context: Context) {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val audioAttributes = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ALARM)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                .build()
-
-            val alarmSound: Uri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
-
             val channel = NotificationChannel(
                 ALARM_CHANNEL_ID,
                 "Critical Emergency Siren",
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "High-priority sound and siren for critical life-threatening emergencies"
-                setSound(alarmSound, audioAttributes)
-                enableVibration(true)
-                vibrationPattern = longArrayOf(0, 600, 200, 600, 200, 800, 300)
+                description = "High-priority heads-up notification for critical life-threatening emergencies"
+                // Channel must be completely silent and vibration-free.
+                // The dedicated EmergencyAlarmManager audio engine plays the looping alarm
+                // and vibration directly. Having sound/vibration on the channel causes
+                // Android's notification service to play simultaneously, producing a double alarm echo.
+                setSound(null, null)
+                enableVibration(false)
                 lockscreenVisibility = NotificationCompat.VISIBILITY_PUBLIC
                 setShowBadge(true)
             }
@@ -110,15 +105,22 @@ class EmergencyAlarmManager(private val context: Context) {
     /**
      * Algorithm for critical alarm:
      * 1. Checks if ticket was already alerted (deduplication).
-     * 2. Marks ticket as alerted.
-     * 3. Plays urgent alarm ringtone with USAGE_ALARM stream.
-     * 4. Starts repeating SOS vibration pulses.
-     * 5. Displays high-priority heads-up notification with action to silence or view.
-     * 6. Automatically times out after 60 seconds to preserve battery.
+     * 2. Synchronized guard to prevent race conditions from concurrent gossip packets.
+     * 3. Marks ticket as alerted in persistent storage.
+     * 4. Plays a single audio alarm stream directly via Ringtone/MediaPlayer.
+     * 5. Starts repeating SOS vibration pulses via Vibrator.
+     * 6. Displays silent heads-up notification with action to silence or view (no secondary system chime).
+     * 7. Automatically times out after 60 seconds to preserve battery.
      */
+    @Synchronized
     fun triggerEmergencyAlarm(ticket: EmergencyTicket) {
         if (alertedTicketIds.contains(ticket.ticketId)) {
             Log.d(TAG, "Ticket ${ticket.ticketId} was already alarmed on this device. Suppressing duplicate siren.")
+            return
+        }
+
+        // If alarm is already ringing for this exact ticket, don't re-trigger
+        if (_isAlarmActive.value && _activeCriticalTicket.value?.ticketId == ticket.ticketId) {
             return
         }
 
@@ -239,6 +241,8 @@ class EmergencyAlarmManager(private val context: Context) {
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setOngoing(true)
             .setAutoCancel(false)
+            .setSilent(true) // Crucial: Suppresses system chime because EmergencyAlarmManager handles ringtone directly
+            .setOnlyAlertOnce(true)
             .setContentIntent(openPendingIntent)
             .addAction(
                 android.R.drawable.ic_media_pause,

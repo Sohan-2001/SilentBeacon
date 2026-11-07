@@ -23,21 +23,29 @@ class MeshRelayService : Service() {
         const val ACTION_STOP_RELAY = "com.example.service.STOP_RELAY"
 
         fun startService(context: Context) {
-            val intent = Intent(context, MeshRelayService::class.java).apply {
-                action = ACTION_START_RELAY
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                val intent = Intent(context, MeshRelayService::class.java).apply {
+                    action = ACTION_START_RELAY
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("MeshRelayService", "Unable to start MeshRelayService (likely Android Go background restriction)", e)
             }
         }
 
         fun stopService(context: Context) {
-            val intent = Intent(context, MeshRelayService::class.java).apply {
-                action = ACTION_STOP_RELAY
+            try {
+                val intent = Intent(context, MeshRelayService::class.java).apply {
+                    action = ACTION_STOP_RELAY
+                }
+                context.stopService(intent)
+            } catch (e: Exception) {
+                android.util.Log.e("MeshRelayService", "Unable to stop MeshRelayService", e)
             }
-            context.stopService(intent)
         }
     }
 
@@ -48,26 +56,45 @@ class MeshRelayService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP_RELAY) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            } catch (e: Exception) {
+                // Ignore
+            }
             return START_NOT_STICKY
         }
 
         val notification = buildForegroundNotification()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-            )
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                try {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    )
+                } catch (se: SecurityException) {
+                    // Fallback for Android Go or devices restricting foreground service types
+                    startForeground(NOTIFICATION_ID, notification)
+                } catch (iae: IllegalArgumentException) {
+                    startForeground(NOTIFICATION_ID, notification)
+                }
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("MeshRelayService", "startForeground failed safely", e)
         }
 
-        // Ensure mesh is active
+        // Ensure mesh is active if initialized
         val app = application as? SilentBeaconApp
-        app?.meshManager?.startMesh()
+        try {
+            app?.meshManager?.startMesh()
+        } catch (e: Exception) {
+            android.util.Log.e("MeshRelayService", "Failed starting mesh from service", e)
+        }
 
         return START_STICKY
     }

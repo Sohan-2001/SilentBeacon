@@ -2,6 +2,10 @@ package com.example.network
 
 import android.content.Context
 import android.util.Log
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothManager
+import com.google.android.gms.common.api.ApiException
+import com.google.android.gms.nearby.connection.ConnectionsStatusCodes
 import com.google.android.gms.nearby.Nearby
 import com.google.android.gms.nearby.connection.AdvertisingOptions
 import com.google.android.gms.nearby.connection.ConnectionInfo
@@ -31,6 +35,13 @@ import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.nio.charset.StandardCharsets
 
+enum class MeshRadioStatus {
+    ACTIVE_MESH,         // Both broadcast advertising and discovery are active
+    LISTENER_ONLY,       // Operating in listener/central mode (BLE multi-advertising not supported or busy)
+    RADIO_DISABLED,      // Bluetooth or Wi-Fi radio is off in Android settings
+    STOPPED
+}
+
 class NearbyConnectionsMeshManager(
     private val context: Context,
     val localNodeId: String,
@@ -56,29 +67,67 @@ class NearbyConnectionsMeshManager(
     private val _isMeshActive = MutableStateFlow(false)
     val isMeshActive: StateFlow<Boolean> = _isMeshActive.asStateFlow()
 
+    private val _radioStatus = MutableStateFlow(MeshRadioStatus.STOPPED)
+    val radioStatus: StateFlow<MeshRadioStatus> = _radioStatus.asStateFlow()
+
     private val _activityLogs = MutableSharedFlow<MeshActivityLog>(replay = 50)
     val activityLogs: SharedFlow<MeshActivityLog> = _activityLogs.asSharedFlow()
 
     private val connectingEndpoints = mutableSetOf<String>()
 
+    fun isBluetoothEnabled(): Boolean {
+        return try {
+            val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+            val adapter = bm?.adapter ?: BluetoothAdapter.getDefaultAdapter()
+            adapter?.isEnabled == true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    fun isBleAdvertisingSupported(): Boolean {
+        return try {
+            val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+            val adapter = bm?.adapter ?: BluetoothAdapter.getDefaultAdapter()
+            adapter != null && adapter.isEnabled && adapter.isMultipleAdvertisementSupported
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     fun startMesh() {
         if (_isMeshActive.value) return
         _isMeshActive.value = true
-        logActivity("RADIO", "Starting BLE & Wi-Fi Direct Mesh (P2P Cluster)")
-        startAdvertising()
+        logActivity("RADIO", "Starting Radio Mesh")
+
+        val btEnabled = isBluetoothEnabled()
+        if (!btEnabled) {
+            logActivity("RADIO_OFF", "Bluetooth is disabled in Android settings. Operating in passive listener standby.")
+            _radioStatus.value = MeshRadioStatus.RADIO_DISABLED
+        }
+
+        // Only attempt BLE advertising if hardware supports peripheral advertising mode
+        if (btEnabled && isBleAdvertisingSupported()) {
+            startAdvertising()
+        } else if (btEnabled) {
+            logActivity("RADIO_INFO", "Device radio lacks BLE multi-advertising (e.g. emulator). Listener mode active.")
+            _radioStatus.value = MeshRadioStatus.LISTENER_ONLY
+        }
+
         startDiscovery()
     }
 
     fun stopMesh() {
         if (!_isMeshActive.value) return
         _isMeshActive.value = false
+        _radioStatus.value = MeshRadioStatus.STOPPED
         logActivity("RADIO", "Stopping Radio Mesh & Disconnecting peers")
         try {
             client.stopAdvertising()
             client.stopDiscovery()
             client.stopAllEndpoints()
         } catch (e: Exception) {
-            Log.e(TAG, "Error stopping Nearby", e)
+            Log.w(TAG, "Notice stopping Nearby: ${e.message}")
         }
         connectingEndpoints.clear()
         _connectedPeers.value = emptySet()
@@ -92,10 +141,21 @@ class NearbyConnectionsMeshManager(
         client.startAdvertising(localNodeId, SERVICE_ID, connectionLifecycleCallback, advertisingOptions)
             .addOnSuccessListener {
                 logActivity("BLE_ADV", "Advertising broadcast beacon: $localNodeId")
+                _radioStatus.value = MeshRadioStatus.ACTIVE_MESH
             }
             .addOnFailureListener { e ->
-                logActivity("BLE_ADV_ERR", "Advertising error: ${e.localizedMessage}")
-                Log.e(TAG, "Failed to start advertising", e)
+                if (e is ApiException && (e.statusCode == ConnectionsStatusCodes.STATUS_ALREADY_ADVERTISING || e.statusCode == 8003)) {
+                    logActivity("BLE_ADV", "Mesh radio beacon already active: $localNodeId")
+                    _radioStatus.value = MeshRadioStatus.ACTIVE_MESH
+                } else if (e is ApiException && (e.statusCode == ConnectionsStatusCodes.STATUS_RADIO_ERROR || e.statusCode == 8007)) {
+                    // STATUS_RADIO_ERROR 8007: Device radio cannot advertise or is disabled
+                    logActivity("RADIO_STANDBY", "Radio beacon in listener mode (status 8007). Scanning for peers...")
+                    Log.w(TAG, "Radio error 8007 on advertising: BLE peripheral mode not supported or radio busy. Operating in listener mode.")
+                    _radioStatus.value = MeshRadioStatus.LISTENER_ONLY
+                } else {
+                    logActivity("BLE_ADV_ERR", "Advertising notice: ${e.localizedMessage}")
+                    Log.w(TAG, "Nearby advertising notice: ${e.message}")
+                }
             }
     }
 
@@ -107,11 +167,36 @@ class NearbyConnectionsMeshManager(
         client.startDiscovery(SERVICE_ID, endpointDiscoveryCallback, discoveryOptions)
             .addOnSuccessListener {
                 logActivity("BLE_DISC", "Scanning for nearby emergency radio beacons...")
+                if (_radioStatus.value != MeshRadioStatus.RADIO_DISABLED && _radioStatus.value != MeshRadioStatus.ACTIVE_MESH) {
+                    _radioStatus.value = MeshRadioStatus.LISTENER_ONLY
+                }
             }
             .addOnFailureListener { e ->
-                logActivity("BLE_DISC_ERR", "Discovery error: ${e.localizedMessage}")
-                Log.e(TAG, "Failed to start discovery", e)
+                if (e is ApiException && (e.statusCode == ConnectionsStatusCodes.STATUS_ALREADY_DISCOVERING || e.statusCode == 8004)) {
+                    logActivity("BLE_DISC", "Discovery scanner already running")
+                } else if (e is ApiException && (e.statusCode == ConnectionsStatusCodes.STATUS_RADIO_ERROR || e.statusCode == 8007)) {
+                    logActivity("RADIO_OFF", "Radio scanner paused (status 8007). Enable Bluetooth/Location in Settings.")
+                    Log.w(TAG, "Radio error 8007 on discovery: Bluetooth or Location service is turned off.")
+                    _radioStatus.value = MeshRadioStatus.RADIO_DISABLED
+                } else {
+                    logActivity("BLE_DISC_ERR", "Discovery notice: ${e.localizedMessage}")
+                    Log.w(TAG, "Nearby discovery notice: ${e.message}")
+                }
             }
+    }
+
+    fun simulatePeerConnection(mockNodeId: String = "peer-" + (1000..9999).random()): String {
+        _connectedPeers.value = _connectedPeers.value + mockNodeId
+        logActivity("DRILL_PEER", "Drill mode: Connected simulated peer $mockNodeId in range")
+        scope.launch {
+            onPeerConnectedListener?.invoke(mockNodeId)
+        }
+        return mockNodeId
+    }
+
+    fun simulatePeerDisconnection(mockNodeId: String) {
+        _connectedPeers.value = _connectedPeers.value - mockNodeId
+        logActivity("DRILL_PEER", "Drill mode: Disconnected simulated peer $mockNodeId")
     }
 
     private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
