@@ -1,0 +1,817 @@
+```markdown
+# Specification & Implementation Blueprint: SilentBeacon (Android)
+
+You are an expert Android Systems and P2P Networking Engineer. We are building **SilentBeacon**, a local-first, zero-bandwidth emergency coordination application for Android. The application operates in disaster and network-blackout scenarios where cellular and internet infrastructures are offline. It forms a peer-to-peer epidemic gossip mesh over local device radios (Bluetooth Low Energy and Wi-Fi Direct/LAN) and uses conflict-free, local-first storage.
+
+Generate the complete, production-ready Android implementation using Kotlin and modern Android architecture.
+
+---
+
+## 1. System Architecture & Constraints
+
+
+```
+
+┌────────────────────────────────────────────────────────┐
+│                   Jetpack Compose UI                   │
+│   (SOS Dispatch Sheet | Emergency Feed | Peer Radar)   │
+└───────────────────────────┬────────────────────────────┘
+│
+┌───────────────────────────▼────────────────────────────┐
+│                    ViewModel Layer                     │
+│    (StateFlow, Lamport Clock Tick, UI State Machine)   │
+└─────────────┬────────────────────────────┬─────────────┘
+│                            │
+┌─────────────▼────────────┐ ┌─────────────▼─────────────┐
+│   Offline Sync Engine    │ │   P2P Mesh Network Layer  │
+│  - Merkle / Clock Vector │ │  - Nearby Connections API │
+│  - Gossip Deduplication  │ │  - BLE + Wi-Fi Direct     │
+│  - Conflict Resolution   │ │  - Epidemic Routing (TTL) │
+└─────────────┬────────────┘ └─────────────┬─────────────┘
+│                            │
+┌─────────────▼────────────────────────────▼─────────────┐
+│                 Room Database (SQLite)                 │
+│         (Encrypted / Unencrypted Local Ledger)         │
+└────────────────────────────────────────────────────────┘
+
+```
+
+### Core Design Rules
+1. **Zero External Network Calls:** No HTTP, no cloud fallback, no remote analytics.
+2. **Store-and-Forward Epidemic Gossip:** Every node acts as an opportunistic relay. When node A meets node B, they exchange vector clocks, compute delta packets, sync missing tickets, and decrement packet TTL.
+3. **Deterministic Conflict-Free Resolution (LWW-CRDT):** State conflicts (e.g., ticket status changing from `OPEN` to `RESOLVED`) are resolved via Lamport Timestamps combined with monotonic node IDs.
+4. **Resilient Background Execution:** P2P advertising and discovery must run inside a Foreground Service with a low-power Bluetooth Low Energy (BLE) scanning profile that escalates to high-bandwidth Wi-Fi Direct on payload transfer.
+
+---
+
+## 2. Technology Stack & Dependencies
+
+Target API: Android 14 (API 34) | Minimum API: Android 26 (API 26)
+
+Add the following dependencies to `build.gradle.kts (Module: app)`:
+```kotlin
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.kapt)
+    alias(libs.plugins.kotlin.serialization)
+}
+
+dependencies {
+    // Jetpack Compose & Material 3
+    implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.activity:activity-compose:1.9.2")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.5")
+
+    // P2P Networking: Google Play Services Nearby Connections
+    // (Strategy.P2P_CLUSTER: M-to-N mesh with BLE advertising & Wi-Fi Direct data transport)
+    implementation("com.google.android.gms:play-services-nearby:19.3.0")
+
+    // Local Storage: Room
+    implementation("androidx.room:room-runtime:2.6.1")
+    implementation("androidx.room:room-ktx:2.6.1")
+    kapt("androidx.room:room-compiler:2.6.1")
+
+    // Serialization & Concurrency
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.2")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
+
+    // Location (Offline Hardware GPS Provider)
+    implementation("com.google.android.gms:play-services-location:21.3.0")
+}
+
+```
+
+---
+
+## 3. Data Schema & CRDT Packet Definitions
+
+### 3.1 Entities and Models (`data/model/TicketModels.kt`)
+
+```kotlin
+package com.silentbeacon.data.model
+
+import androidx.room.Entity
+import androidx.room.PrimaryKey
+import kotlinx.serialization.Serializable
+
+enum class UrgencyLevel { CRITICAL, HIGH, MEDIUM, LOW }
+enum class TicketCategory { MEDICAL, WATER_FOOD, RESCUE, SHELTER, HAZARD }
+enum class TicketStatus { OPEN, ACKNOWLEDGED, RESOLVED }
+
+@Serializable
+@Entity(tableName = "tickets")
+data class EmergencyTicket(
+    @PrimaryKey val ticketId: String,          // UUID v4
+    val authorNodeId: String,                  // SHA-256 slice of device install ID
+    val category: TicketCategory,
+    val urgency: UrgencyLevel,
+    val title: String,
+    val description: String,
+    val latitude: Double?,
+    val longitude: Double?,
+    val locationDescription: String,
+    val status: TicketStatus,
+    val lamportClock: Long,                    // Logical timestamp for CRDT ordering
+    val createdAtEpochMs: Long,
+    val hopCount: Int = 0,                     // Incremented each relay hop
+    val maxHops: Int = 7                       // TTL boundary
+)
+
+@Serializable
+data class SyncVectorClock(
+    val nodeId: String,
+    val maxClockObserved: Long,
+    val knownTicketIds: List<String>
+)
+
+@Serializable
+sealed class MeshPayload {
+    @Serializable
+    data class Handshake(val vector: SyncVectorClock) : MeshPayload()
+
+    @Serializable
+    data class DeltaRequest(val missingTicketIds: List<String>) : MeshPayload()
+
+    @Serializable
+    data class DeltaBundle(val tickets: List<EmergencyTicket>) : MeshPayload()
+
+    @Serializable
+    data class StatusUpdate(
+        val ticketId: String,
+        val updatedStatus: TicketStatus,
+        val lamportClock: Long,
+        val updaterNodeId: String
+    ) : MeshPayload()
+}
+
+```
+
+---
+
+## 4. Local Database & DAO Layer
+
+### 4.1 Room DAO (`data/local/TicketDao.kt`)
+
+```kotlin
+package com.silentbeacon.data.local
+
+import androidx.room.*
+import com.silentbeacon.data.model.EmergencyTicket
+import com.silentbeacon.data.model.TicketStatus
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface TicketDao {
+    @Query("SELECT * FROM tickets ORDER BY urgency ASC, lamportClock DESC")
+    fun observeAllTickets(): Flow<List<EmergencyTicket>>
+
+    @Query("SELECT * FROM tickets WHERE ticketId = :id")
+    suspend fun getTicketById(id: String): EmergencyTicket?
+
+    @Query("SELECT ticketId FROM tickets")
+    suspend fun getAllTicketIds(): List<String>
+
+    @Query("SELECT MAX(lamportClock) FROM tickets")
+    suspend fun getMaxClock(): Long?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdate(ticket: EmergencyTicket)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun insertOrUpdateAll(tickets: List<EmergencyTicket>)
+
+    @Query("UPDATE tickets SET status = :status, lamportClock = :newClock WHERE ticketId = :ticketId AND lamportClock < :newClock")
+    suspend fun updateStatusIfNewer(ticketId: String, status: TicketStatus, newClock: Long): Int
+}
+
+```
+
+### 4.2 Room Database (`data/local/BeaconDatabase.kt`)
+
+```kotlin
+package com.silentbeacon.data.local
+
+import androidx.room.Database
+import androidx.room.RoomDatabase
+import com.silentbeacon.data.model.EmergencyTicket
+
+@Database(entities = [EmergencyTicket::class], version = 1, exportSchema = false)
+abstract class BeaconDatabase : RoomDatabase() {
+    abstract fun ticketDao(): TicketDao
+}
+
+```
+
+---
+
+## 5. Peer-to-Peer Mesh Networking Layer
+
+Implement `NearbyConnectionsMeshManager.kt` using Google Nearby Connections with `Strategy.P2P_CLUSTER`. This enables ad-hoc, multi-peer mesh clusters without internet access.
+
+### 5.1 Mesh Manager (`network/NearbyConnectionsMeshManager.kt`)
+
+```kotlin
+package com.silentbeacon.network
+
+import android.content.Context
+import com.google.android.gms.nearby.Nearby
+import com.google.android.gms.nearby.connection.*
+import com.silentbeacon.data.model.*
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import java.nio.charset.StandardCharsets
+
+class NearbyConnectionsMeshManager(
+    private val context: Context,
+    private val localNodeId: String,
+    private val onPayloadReceivedListener: suspend (MeshPayload, String) -> Unit
+) {
+    private val client = Nearby.getConnectionsClient(context)
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val serviceId = "com.silentbeacon.mesh.v1"
+
+    private val _connectedPeers = MutableStateFlow<Set<String>>(emptySet())
+    val connectedPeers: StateFlow<Set<String>> = _connectedPeers
+
+    fun startMesh() {
+        startAdvertising()
+        startDiscovery()
+    }
+
+    fun stopMesh() {
+        client.stopAdvertising()
+        client.stopDiscovery()
+        client.stopAllEndpoints()
+        _connectedPeers.value = emptySet()
+    }
+
+    private fun startAdvertising() {
+        val advertisingOptions = AdvertisingOptions.Builder()
+            .setStrategy(Strategy.P2P_CLUSTER)
+            .build()
+
+        client.startAdvertising(localNodeId, serviceId, connectionLifecycleCallback, advertisingOptions)
+    }
+
+    private fun startDiscovery() {
+        val discoveryOptions = DiscoveryOptions.Builder()
+            .setStrategy(Strategy.P2P_CLUSTER)
+            .build()
+
+        client.startDiscovery(serviceId, endpointDiscoveryCallback, discoveryOptions)
+    }
+
+    private val endpointDiscoveryCallback = object : EndpointDiscoveryCallback() {
+        override fun onEndpointFound(endpointId: String, info: DiscoveredEndpointInfo) {
+            // Auto-initiate connection with discovered peers
+            client.requestConnection(localNodeId, endpointId, connectionLifecycleCallback)
+        }
+        override fun onEndpointLost(endpointId: String) {}
+    }
+
+    private val connectionLifecycleCallback = object : ConnectionLifecycleCallback() {
+        override fun onConnectionInitiated(endpointId: String, connectionInfo: ConnectionInfo) {
+            // Unattended, zero-friction pairing for emergency response
+            client.acceptConnection(endpointId, payloadCallback)
+        }
+
+        override fun onConnectionResult(endpointId: String, result: ConnectionResolution) {
+            if (result.status.isSuccess) {
+                _connectedPeers.value = _connectedPeers.value + endpointId
+            } else {
+                _connectedPeers.value = _connectedPeers.value - endpointId
+            }
+        }
+
+        override fun onDisconnected(endpointId: String) {
+            _connectedPeers.value = _connectedPeers.value - endpointId
+        }
+    }
+
+    private val payloadCallback = object : PayloadCallback() {
+        override fun onPayloadReceived(endpointId: String, payload: Payload) {
+            if (payload.type == Payload.Type.BYTES) {
+                payload.asBytes()?.let { bytes ->
+                    val jsonStr = String(bytes, StandardCharsets.UTF_8)
+                    scope.launch {
+                        try {
+                            val decoded = Json.decodeFromString<MeshPayload>(jsonStr)
+                            onPayloadReceivedListener(decoded, endpointId)
+                        } catch (e: Exception) {
+                            // Suppress invalid malformed gossip packets
+                        }
+                    }
+                }
+            }
+        }
+        override fun onPayloadTransferUpdate(endpointId: String, update: PayloadTransferUpdate) {}
+    }
+
+    suspend fun sendPayload(endpointId: String, payload: MeshPayload) = withContext(Dispatchers.IO) {
+        val jsonStr = Json.encodeToString(payload)
+        val bytes = jsonStr.toByteArray(StandardCharsets.UTF_8)
+        client.sendPayload(endpointId, Payload.fromBytes(bytes))
+    }
+
+    suspend fun broadcastPayload(payload: MeshPayload) = withContext(Dispatchers.IO) {
+        val targets = _connectedPeers.value.toList()
+        if (targets.isNotEmpty()) {
+            val jsonStr = Json.encodeToString(payload)
+            val bytes = jsonStr.toByteArray(StandardCharsets.UTF_8)
+            client.sendPayload(targets, Payload.fromBytes(bytes))
+        }
+    }
+}
+
+```
+
+---
+
+## 6. Offline Synchronization & CRDT Engine
+
+### 6.1 Sync Protocol Engine (`data/sync/MeshSyncEngine.kt`)
+
+```kotlin
+package com.silentbeacon.data.sync
+
+import com.silentbeacon.data.local.TicketDao
+import com.silentbeacon.data.model.*
+import com.silentbeacon.network.NearbyConnectionsMeshManager
+import kotlinx.coroutines.flow.first
+import java.util.concurrent.atomic.AtomicLong
+
+class MeshSyncEngine(
+    private val dao: TicketDao,
+    private val meshManager: NearbyConnectionsMeshManager,
+    private val localNodeId: String
+) {
+    private val localLamportClock = AtomicLong(0)
+
+    init {
+        // Initialize Lamport clock to highest known DB clock value
+        // Note: Done asynchronously in real setup via coroutine
+    }
+
+    fun incrementClock(): Long = localLamportClock.incrementAndGet()
+
+    fun updateClockOnReceived(remoteClock: Long) {
+        localLamportClock.updateAndGet { current -> maxOf(current, remoteClock) + 1 }
+    }
+
+    suspend fun handleIncomingPayload(payload: MeshPayload, fromEndpointId: String) {
+        when (payload) {
+            is MeshPayload.Handshake -> {
+                updateClockOnReceived(payload.vector.maxClockObserved)
+                val allKnownIds = dao.getAllTicketIds()
+                val missingIdsForPeer = allKnownIds.filter { it !in payload.vector.knownTicketIds }
+                if (missingIdsForPeer.isNotEmpty()) {
+                    val ticketsToSend = missingIdsForPeer.mapNotNull { dao.getTicketById(it) }
+                    meshManager.sendPayload(fromEndpointId, MeshPayload.DeltaBundle(ticketsToSend))
+                }
+            }
+
+            is MeshPayload.DeltaBundle -> {
+                val forwardableTickets = mutableListOf<EmergencyTicket>()
+                for (ticket in payload.tickets) {
+                    updateClockOnReceived(ticket.lamportClock)
+                    val existing = dao.getTicketById(ticket.ticketId)
+                    if (existing == null || ticket.lamportClock > existing.lamportClock) {
+                        dao.insertOrUpdate(ticket)
+                        if (ticket.hopCount < ticket.maxHops) {
+                            forwardableTickets.add(ticket.copy(hopCount = ticket.hopCount + 1))
+                        }
+                    }
+                }
+                // Gossip relay forwardable packets to all other peers
+                if (forwardableTickets.isNotEmpty()) {
+                    meshManager.broadcastPayload(MeshPayload.DeltaBundle(forwardableTickets))
+                }
+            }
+
+            is MeshPayload.StatusUpdate -> {
+                updateClockOnReceived(payload.lamportClock)
+                val updatedRows = dao.updateStatusIfNewer(
+                    payload.ticketId,
+                    payload.updatedStatus,
+                    payload.lamportClock
+                )
+                if (updatedRows > 0) {
+                    // Re-broadcast status progression to remaining mesh
+                    meshManager.broadcastPayload(payload)
+                }
+            }
+
+            is MeshPayload.DeltaRequest -> {
+                val requestedTickets = payload.missingTicketIds.mapNotNull { dao.getTicketById(it) }
+                if (requestedTickets.isNotEmpty()) {
+                    meshManager.sendPayload(fromEndpointId, MeshPayload.DeltaBundle(requestedTickets))
+                }
+            }
+        }
+    }
+
+    suspend fun initiateHandshakeWithPeer(endpointId: String) {
+        val knownIds = dao.getAllTicketIds()
+        val maxClock = dao.getMaxClock() ?: 0L
+        val handshake = MeshPayload.Handshake(
+            SyncVectorClock(
+                nodeId = localNodeId,
+                maxClockObserved = maxClock,
+                knownTicketIds = knownIds
+            )
+        )
+        meshManager.sendPayload(endpointId, handshake)
+    }
+
+    suspend fun createAndBroadcastTicket(
+        category: TicketCategory,
+        urgency: UrgencyLevel,
+        title: String,
+        description: String,
+        latitude: Double?,
+        longitude: Double?,
+        locationDescription: String
+    ): EmergencyTicket {
+        val clock = incrementClock()
+        val ticket = EmergencyTicket(
+            ticketId = java.util.UUID.randomUUID().toString(),
+            authorNodeId = localNodeId,
+            category = category,
+            urgency = urgency,
+            title = title,
+            description = description,
+            latitude = latitude,
+            longitude = longitude,
+            locationDescription = locationDescription,
+            status = TicketStatus.OPEN,
+            lamportClock = clock,
+            createdAtEpochMs = System.currentTimeMillis(),
+            hopCount = 0
+        )
+        dao.insertOrUpdate(ticket)
+        meshManager.broadcastPayload(MeshPayload.DeltaBundle(listOf(ticket)))
+        return ticket
+    }
+}
+
+```
+
+---
+
+## 7. Foreground Mesh Service
+
+To guarantee continuous store-and-forward mesh propagation during screen-off intervals, host the mesh lifecycle inside an Android Foreground Service.
+
+### 7.1 Service Implementation (`service/MeshRelayService.kt`)
+
+```kotlin
+package com.silentbeacon.service
+
+import android.app.*
+import android.content.Intent
+import android.os.IBinder
+import androidx.core.app.NotificationCompat
+import com.silentbeacon.R
+
+class MeshRelayService : Service() {
+    private val channelId = "SilentBeaconMeshChannel"
+    private val notificationId = 1001
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        val notification = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("SilentBeacon Mesh Active")
+            .setContentText("Relaying emergency signals via local radio mesh...")
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setOngoing(true)
+            .build()
+        startForeground(notificationId, notification)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        return START_STICKY
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun createNotificationChannel() {
+        val channel = NotificationChannel(
+            channelId,
+            "Mesh Background Service",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        val manager = getSystemService(NotificationManager::class.java)
+        manager?.createNotificationChannel(channel)
+    }
+}
+
+```
+
+---
+
+## 8. Android Permissions Manifest Setup
+
+Add the following to `AndroidManifest.xml`:
+
+```xml
+<manifest xmlns:android="[http://schemas.android.com/apk/res/android](http://schemas.android.com/apk/res/android)"
+    package="com.silentbeacon">
+
+    <!-- Zero-bandwidth P2P radio hardware permissions -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" />
+
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+
+    <application
+        android:allowBackup="false"
+        android:label="SilentBeacon"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <service
+            android:name=".service.MeshRelayService"
+            android:foregroundServiceType="connectedDevice"
+            android:exported="false" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.NoActionBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+
+```
+
+---
+
+## 9. Jetpack Compose UI Layer
+
+Build a clean UI with:
+
+1. **Radar Status Bar:** Displays active physical peer count and mesh sync indicator.
+2. **Emergency Stream:** Categorized, color-coded incident list ordered by urgency and logical clock.
+3. **Emergency Dispatch Modal:** Simple form for fast ticket submission.
+
+### 9.1 Emergency Screen (`ui/EmergencyDashboardScreen.kt`)
+
+```kotlin
+package com.silentbeacon.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CellTower
+import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.silentbeacon.data.model.*
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun EmergencyDashboardScreen(
+    tickets: List<EmergencyTicket>,
+    connectedPeerCount: Int,
+    onDispatchTicket: (category: TicketCategory, urgency: UrgencyLevel, title: String, desc: String, locDesc: String) -> Unit,
+    onResolveTicket: (ticketId: String) -> Unit
+) {
+    var showDispatchDialog by remember { mutableStateOf(false) }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("SilentBeacon Mesh", fontWeight = FontWeight.Bold) },
+                actions = {
+                    Row(
+                        modifier = Modifier
+                            .padding(end = 12.dp)
+                            .background(
+                                color = if (connectedPeerCount > 0) Color(0xFF1B5E20) else Color(0xFFB71C1C),
+                                shape = RoundedCornerShape(16.dp)
+                            )
+                            .padding(horizontal = 10.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Default.CellTower, contentDescription = null, tint = Color.White, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "$connectedPeerCount Peers",
+                            color = Color.White,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+            )
+        },
+        floatingActionButton = {
+            FloatingActionButton(
+                onClick = { showDispatchDialog = true },
+                containerColor = MaterialTheme.colorScheme.error
+            ) {
+                Icon(Icons.Default.Add, contentDescription = "New SOS", tint = Color.White)
+            }
+        }
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+        ) {
+            if (tickets.isEmpty()) {
+                Box(
+                    modifier = Modifier.fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("No emergency broadcasts in local radius.", color = Color.Gray)
+                }
+            } else {
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    items(tickets, key = { it.ticketId }) { ticket ->
+                        TicketCard(ticket = ticket, onResolve = { onResolveTicket(ticket.ticketId) })
+                    }
+                }
+            }
+        }
+
+        if (showDispatchDialog) {
+            DispatchTicketDialog(
+                onDismiss = { showDispatchDialog = false },
+                onSubmit = { cat, urg, title, desc, locDesc ->
+                    onDispatchTicket(cat, urg, title, desc, locDesc)
+                    showDispatchDialog = false
+                }
+            )
+        }
+    }
+}
+
+@Composable
+fun TicketCard(ticket: EmergencyTicket, onResolve: () -> Unit) {
+    val urgencyColor = when (ticket.urgency) {
+        UrgencyLevel.CRITICAL -> Color(0xFFD32F2F)
+        UrgencyLevel.HIGH -> Color(0xFFF57C00)
+        UrgencyLevel.MEDIUM -> Color(0xFFFBC02D)
+        UrgencyLevel.LOW -> Color(0xFF388E3C)
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .background(urgencyColor, shape = RoundedCornerShape(4.dp))
+                            .padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(ticket.urgency.name, color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(ticket.category.name, fontWeight = FontWeight.SemiBold, fontSize = 12.sp)
+                }
+
+                Text(
+                    text = if (ticket.status == TicketStatus.RESOLVED) "RESOLVED" else "HOPS: ${ticket.hopCount}",
+                    fontSize = 11.sp,
+                    color = if (ticket.status == TicketStatus.RESOLVED) Color(0xFF2E7D32) else Color.Gray,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(ticket.title, fontSize = 16.sp, fontWeight = FontWeight.Bold)
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(ticket.description, fontSize = 14.sp)
+
+            Spacer(modifier = Modifier.height(8.dp))
+            Text("Location: ${ticket.locationDescription}", fontSize = 12.sp, color = Color.DarkGray)
+
+            if (ticket.status != TicketStatus.RESOLVED) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = onResolve,
+                    modifier = Modifier.align(Alignment.End),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
+                ) {
+                    Text("Mark as Resolved", fontSize = 12.sp)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun DispatchTicketDialog(
+    onDismiss: () -> Unit,
+    onSubmit: (TicketCategory, UrgencyLevel, String, String, String) -> Unit
+) {
+    var title by remember { mutableStateOf("") }
+    var description by remember { mutableStateOf("") }
+    var locationDesc by remember { mutableStateOf("") }
+    var selectedCategory by remember { mutableStateOf(TicketCategory.MEDICAL) }
+    var selectedUrgency by remember { mutableStateOf(UrgencyLevel.CRITICAL) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Broadcast Emergency Signal") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("What is needed?") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = description,
+                    onValueChange = { description = it },
+                    label = { Text("Details (e.g. 2 adults, diabetic)") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = locationDesc,
+                    onValueChange = { locationDesc = it },
+                    label = { Text("Location Landmark (e.g. Sector 4, School Roof)") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = {
+                    if (title.isNotBlank() && locationDesc.isNotBlank()) {
+                        onSubmit(selectedCategory, selectedUrgency, title, description, locationDesc)
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+            ) {
+                Text("Broadcast SOS")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+```
+
+---
+
+## 10. Execution Directives for Google AI Studio
+
+1. **Deterministic Lifecycle Handling:** Implement runtime permission checks for `NEARBY_WIFI_DEVICES`, `BLUETOOTH_SCAN`, `BLUETOOTH_ADVERTISE`, `BLUETOOTH_CONNECT`, and `ACCESS_FINE_LOCATION` on startup before spinning up the mesh engine.
+2. **Auto-Reconnection Gossip Loop:** When two devices establish a connection via `Nearby.getConnectionsClient`, immediately trigger `initiateHandshakeWithPeer()`.
+3. **CRDT Merge Invariant:** Guarantee that status updates only apply if the incoming packet has `lamportClock > currentTicket.lamportClock`, breaking ties using the lexicographical comparison of `updaterNodeId`.
+4. **Offline GPS Fallback:** Retrieve the last known location via `FusedLocationProviderClient` with `Priority.PRIORITY_HIGH_ACCURACY` over hardware GPS. If null (e.g., user is indoors), gracefully rely on the manual `locationDescription`.
+
+```
+
+```
